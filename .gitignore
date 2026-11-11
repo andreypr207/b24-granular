@@ -1,0 +1,5 @@
+node_modules/
+tests/e2e/workflow.test.json
+.n8n/
+*.log
+.DS_Store

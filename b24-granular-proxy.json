@@ -1,0 +1,265 @@
+{
+  "name": "Битрикс24 — прокси с ключами и правами",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Прокси Битрикс24 с ключами\n\n**Как подключить интеграцию:**\n1. Откройте узел **⚙️ Настройки**, добавьте блок в `KEYS`: имя, ключ, методы (по одному на строку), при желании IP.\n2. Ключ: `openssl rand -hex 24`\n3. Выдайте интеграции адрес вместо вебхука Б24:\n`https://<n8n>/webhook/<id>/b24/<КЛЮЧ>/`\n(точный адрес — Production URL в узле **Webhook Б24**, вместо `:key` — ключ, вместо `:method` — метод)\n\nЗапросы те же, что к Б24: `.../crm.lead.add.json`, GET или POST (JSON / form). batch проверяется по каждой команде.\n\nПосле правки Настроек нажмите **Publish** (n8n 2.x) или **Save** (n8n 1.x), иначе боевой вебхук работает со старой версией.",
+        "height": 420,
+        "width": 420,
+        "color": 4
+      },
+      "id": "0b0c1c1e-0000-4000-8000-000000000001",
+      "name": "Как пользоваться",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -560,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "multipleMethods": true,
+        "httpMethod": [
+          "GET",
+          "POST"
+        ],
+        "path": "b24/:key/:method",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "0b0c1c1e-0000-4000-8000-000000000002",
+      "name": "Webhook Б24",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -80,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  НАСТРОЙКИ ПРОКСИ БИТРИКС24\n//  Всё, что нужно менять, находится в этом узле.\n// =====================================================================\n\n// 1) Входящий вебхук Битрикс24 с полными правами (с \"/\" на конце или без).\nconst B24_WEBHOOK = 'https://YOUR_PORTAL.bitrix24.ru/rest/1/xxxxxxxxxxxxxxxx/';\n\n// 2) Как определять IP клиента (n8n обычно стоит за nginx).\n//    'x-forwarded-for'  — берётся адрес, который дописал ваш прокси (защищено от подмены);\n//    'x-real-ip'        — nginx: proxy_set_header X-Real-IP $remote_addr;\n//    'cf-connecting-ip' — если перед сервером Cloudflare.\nconst IP_HEADER = 'x-forwarded-for';\n//    Сколько доверенных прокси стоит перед n8n (только для x-forwarded-for):\n//    nginx → n8n = 1;  Cloudflare → nginx → n8n = 2.\nconst PROXY_HOPS = 1;\n\n// 3) Ключи интеграций.\n//    key     — секрет интеграции, минимум 24 символа. Сгенерировать: openssl rand -hex 24\n//    methods — по одному методу на строку. Можно маску: crm.lead.*   Всё подряд: *\n//              batch отдельно указывать не нужно: он пропускается,\n//              если ВСЕ команды внутри него разрешены этому ключу.\n//    ips     — по одному IP или подсети на строку: 1.2.3.4, 10.0.0.0/24, 2a01:4f8::/32.\n//              Пусто — доступ с любого IP.\n//    enabled — false, чтобы временно отключить ключ (необязательно).\n//    Строки, начинающиеся с #, — комментарии.\nconst KEYS = [\n  {\n    name: 'Сайт — заявки',\n    key: 'CHANGE_ME',\n    methods: `\n      crm.lead.add\n    `,\n    ips: `\n    `,\n  },\n\n  {\n    name: 'Пример: телефония, только с сервера АТС',\n    key: 'CHANGE_ME',\n    methods: `\n      crm.lead.add\n      crm.lead.get\n      crm.duplicate.findbycomm\n      crm.activity.*\n    `,\n    ips: `\n      203.0.113.10\n      # 198.51.100.0/24\n    `,\n  },\n];\n\n// ---------------------------------------------------------------------\n//  Ниже ничего менять не нужно.\n// ---------------------------------------------------------------------\nreturn [{\n  json: {\n    req: $input.first().json,\n    cfg: { webhook: B24_WEBHOOK, ipHeader: IP_HEADER, proxyHops: PROXY_HOPS, keys: KEYS },\n  },\n}];\n"
+      },
+      "id": "0b0c1c1e-0000-4000-8000-000000000003",
+      "name": "⚙️ Настройки",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        160,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  ПРОВЕРКА ДОСТУПА: ключ → IP → методы (включая команды внутри batch)\n//  Настройки — в узле «⚙️ Настройки». Этот узел менять не нужно.\n// =====================================================================\nconst { req, cfg } = $input.first().json;\n\nconst METHOD_RE = /^[a-z0-9_-]+(\\.[a-z0-9_-]+)*$/;\nconst BAD_KEYS = new Set(['__proto__', 'constructor', 'prototype']);\n\nfunction deny(statusCode, error, description, extra = {}) {\n  return [{\n    json: {\n      allowed: false,\n      statusCode,\n      responseBody: JSON.stringify({ error, error_description: description }),\n      ...extra,\n    },\n  }];\n}\n\n// --- утилиты -----------------------------------------------------------\nconst lines = (text) => String(text ?? '')\n  .split(/[\\r\\n,]+/)\n  .map((s) => s.replace(/#.*$/, '').trim())\n  .filter(Boolean);\n\nfunction safeEqual(a, b) {\n  if (a.length !== b.length) return false;\n  let r = 0;\n  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);\n  return r === 0;\n}\n\nfunction normalizeMethod(raw) {\n  return String(raw ?? '').trim().toLowerCase().replace(/\\.(json|xml)$/, '');\n}\n\nfunction methodAllowed(method, patterns) {\n  return patterns.some((p) => {\n    if (p === '*') return true;\n    if (p.endsWith('*')) return method.startsWith(p.slice(0, -1));\n    return method === p;\n  });\n}\n\n// \"fields[PHONE][0][VALUE]\" → [\"fields\",\"PHONE\",\"0\",\"VALUE\"]\nfunction splitKey(key) {\n  const m = /^([^[\\]]+)((?:\\[[^[\\]]*\\])+)$/.exec(key);\n  if (!m) return [key];\n  const parts = [m[1]];\n  const re = /\\[([^[\\]]*)\\]/g;\n  let x;\n  while ((x = re.exec(m[2]))) parts.push(x[1]);\n  return parts;\n}\n\nconst isObj = (v) => v !== null && typeof v === 'object';\n\n// Приводит параметры к вложенному виду, как их понимает PHP/Битрикс:\n// плоские ключи вида a[b][c] (из form-urlencoded / query) раскладываются в объекты.\nfunction nest(src, dst = {}) {\n  if (!isObj(src)) return dst;\n  for (const [rawKey, value] of Object.entries(src)) {\n    const parts = splitKey(rawKey);\n    if (parts.some((p) => BAD_KEYS.has(p))) continue;\n    let cur = dst;\n    for (let i = 0; i < parts.length; i++) {\n      let p = parts[i];\n      const last = i === parts.length - 1;\n      if (p === '' && last && Array.isArray(value)) { // a[]=1&a[]=2, собранные парсером в массив\n        for (const v of value) cur[String(Object.keys(cur).length)] = isObj(v) ? nest(v) : v;\n        break;\n      }\n      if (p === '') p = String(Object.keys(cur).length); // a[]=1\n      if (last) {\n        if (isObj(value) && !Array.isArray(value)) {\n          cur[p] = nest(value, isObj(cur[p]) ? cur[p] : {});\n        } else if (Array.isArray(value)) {\n          const arr = value.map((v) => (isObj(v) && !Array.isArray(v) ? nest(v) : v));\n          cur[p] = arr;\n        } else {\n          cur[p] = value;\n        }\n      } else {\n        if (!isObj(cur[p])) cur[p] = {};\n        cur = cur[p];\n      }\n    }\n  }\n  return dst;\n}\n\n// --- IP ------------------------------------------------------------------\nfunction getClientIp(headers) {\n  const h = headers || {};\n  const name = String(cfg.ipHeader || 'x-forwarded-for').toLowerCase();\n  let ip = '';\n  if (name === 'x-forwarded-for') {\n    const chain = String(h['x-forwarded-for'] || '').split(',').map((s) => s.trim()).filter(Boolean);\n    const hops = Math.max(1, Number(cfg.proxyHops) || 1);\n    ip = chain.length >= hops ? chain[chain.length - hops] : '';\n  } else {\n    ip = String(h[name] || '').split(',')[0].trim();\n  }\n  ip = ip.replace(/^\\[|\\]$/g, '');\n  const mapped = /^::ffff:(\\d+\\.\\d+\\.\\d+\\.\\d+)$/i.exec(ip);\n  return mapped ? mapped[1] : ip;\n}\n\nfunction ipv4ToInt(ip) {\n  const p = ip.split('.');\n  if (p.length !== 4) return null;\n  let n = 0;\n  for (const o of p) {\n    if (!/^\\d{1,3}$/.test(o) || Number(o) > 255) return null;\n    n = n * 256 + Number(o);\n  }\n  return n;\n}\n\nfunction ipv6ToBigInt(ip) {\n  if (!ip.includes(':')) return null;\n  let [head, tail] = ip.split('::');\n  if (ip.split('::').length > 2) return null;\n  const h = head ? head.split(':') : [];\n  const t = tail !== undefined ? (tail ? tail.split(':') : []) : null;\n  // IPv4 в хвосте (::ffff:1.2.3.4)\n  const lastArr = t ?? h;\n  if (lastArr.length && lastArr[lastArr.length - 1].includes('.')) {\n    const v4 = ipv4ToInt(lastArr.pop());\n    if (v4 === null) return null;\n    lastArr.push((v4 >>> 16).toString(16), (v4 & 0xffff).toString(16));\n  }\n  let groups;\n  if (t === null) {\n    if (h.length !== 8) return null;\n    groups = h;\n  } else {\n    const fill = 8 - h.length - t.length;\n    if (fill < 0) return null;\n    groups = [...h, ...Array(fill).fill('0'), ...t];\n  }\n  let n = 0n;\n  for (const g of groups) {\n    if (!/^[0-9a-f]{1,4}$/i.test(g)) return null;\n    n = (n << 16n) + BigInt(parseInt(g, 16));\n  }\n  return n;\n}\n\nfunction ipMatches(ip, rule) {\n  const [base, bitsRaw] = rule.split('/');\n  const v4 = ipv4ToInt(ip);\n  const b4 = ipv4ToInt(base);\n  if (v4 !== null && b4 !== null) {\n    const bits = bitsRaw === undefined ? 32 : Number(bitsRaw);\n    if (!(bits >= 0 && bits <= 32)) return false;\n    if (bits === 0) return true;\n    const mask = (0xffffffff << (32 - bits)) >>> 0;\n    return ((v4 & mask) >>> 0) === ((b4 & mask) >>> 0);\n  }\n  const v6 = ipv6ToBigInt(ip);\n  const b6 = ipv6ToBigInt(base);\n  if (v6 !== null && b6 !== null) {\n    const bits = bitsRaw === undefined ? 128 : Number(bitsRaw);\n    if (!(bits >= 0 && bits <= 128)) return false;\n    const shift = BigInt(128 - bits);\n    return (v6 >> shift) === (b6 >> shift);\n  }\n  return false;\n}\n\n// --- 1. Ключ ---------------------------------------------------------------\nconst key = String(req.params?.key ?? '');\nlet client = null;\nfor (const k of cfg.keys || []) {\n  const kk = String(k.key ?? '');\n  if (kk.length < 24 || /CHANGE_ME/i.test(kk) || k.enabled === false) continue;\n  if (safeEqual(kk, key)) client = k;\n}\nif (!client) return deny(401, 'INVALID_CREDENTIALS', 'Invalid request credentials');\n\n// --- 2. IP -----------------------------------------------------------------\nconst clientIp = getClientIp(req.headers);\nconst ipRules = lines(client.ips);\nif (ipRules.length && !(clientIp && ipRules.some((r) => ipMatches(clientIp, r)))) {\n  return deny(403, 'ACCESS_DENIED', `IP ${clientIp || 'unknown'} is not allowed for this key`,\n    { keyName: client.name, clientIp });\n}\n\n// --- 3. Метод и параметры ----------------------------------------------------\nconst method = normalizeMethod(req.params?.method);\nif (!METHOD_RE.test(method)) return deny(404, 'ERROR_METHOD_NOT_FOUND', 'Method not found!');\n\nconst params = nest(req.body, nest(req.query));\ndelete params.auth; // авторизация — только через вебхук прокси\n\nconst patterns = lines(client.methods).map((s) => s.toLowerCase());\nlet checked = [method];\n\nif (method === 'batch') {\n  const cmd = params.cmd;\n  const cmds = isObj(cmd) ? Object.values(cmd) : [];\n  if (!cmds.length) return deny(400, 'INVALID_REQUEST', 'Batch: cmd is empty');\n  checked = cmds.map((c) => normalizeMethod(String(c).split('?')[0]));\n  const bad = checked.find((m) => !METHOD_RE.test(m) || m === 'batch');\n  if (bad !== undefined) return deny(400, 'INVALID_REQUEST', `Batch: invalid command \"${bad}\"`);\n}\n\nconst forbidden = checked.filter((m) => !methodAllowed(m, patterns));\nif (forbidden.length) {\n  return deny(403, 'insufficient_scope',\n    `Method ${forbidden.join(', ')} is not allowed for this key`,\n    { keyName: client.name, clientIp, method });\n}\n\n// --- Разрешено -----------------------------------------------------------------\nreturn [{\n  json: {\n    allowed: true,\n    keyName: client.name,\n    clientIp,\n    method,\n    targetUrl: String(cfg.webhook).replace(/\\/+$/, '') + '/' + method + '.json',\n    payload: params,\n  },\n}];\n"
+      },
+      "id": "0b0c1c1e-0000-4000-8000-000000000004",
+      "name": "🔐 Проверка доступа",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        380,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "5b7f8c2e-1d3a-4e6b-9f0a-2c4d6e8f0a1b",
+              "leftValue": "={{ $json.allowed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0b0c1c1e-0000-4000-8000-000000000005",
+      "name": "Разрешено?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        600,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.targetUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "id": "0b0c1c1e-0000-4000-8000-000000000006",
+      "name": "Запрос в Битрикс24",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        820,
+        -100
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ответ Битрикс24 отдаётся клиенту как есть: тот же HTTP-код и то же тело.\nconst r = $input.first().json;\n\nif (r.error && r.statusCode === undefined) {\n  // Битрикс24 недоступен (сеть, DNS, таймаут)\n  const msg = typeof r.error === 'string' ? r.error : (r.error.message || 'Bitrix24 is unavailable');\n  return [{\n    json: {\n      statusCode: 502,\n      responseBody: JSON.stringify({ error: 'BITRIX24_UNAVAILABLE', error_description: msg }),\n    },\n  }];\n}\n\nlet body = r.body ?? r.data ?? '';\nif (typeof body !== 'string') body = JSON.stringify(body);\n\nreturn [{ json: { statusCode: Number(r.statusCode) || 200, responseBody: body } }];\n"
+      },
+      "id": "0b0c1c1e-0000-4000-8000-000000000007",
+      "name": "Ответ Битрикс24",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.responseBody }}",
+        "options": {
+          "responseCode": "={{ $json.statusCode }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ]
+          }
+        }
+      },
+      "id": "0b0c1c1e-0000-4000-8000-000000000008",
+      "name": "Ответ клиенту",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1300,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook Б24": {
+      "main": [
+        [
+          {
+            "node": "⚙️ Настройки",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "⚙️ Настройки",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "⚙️ Настройки": {
+      "main": [
+        [
+          {
+            "node": "🔐 Проверка доступа",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔐 Проверка доступа": {
+      "main": [
+        [
+          {
+            "node": "Разрешено?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Разрешено?": {
+      "main": [
+        [
+          {
+            "node": "Запрос в Битрикс24",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ответ клиенту",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Запрос в Битрикс24": {
+      "main": [
+        [
+          {
+            "node": "Ответ Битрикс24",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ответ Битрикс24",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ответ Битрикс24": {
+      "main": [
+        [
+          {
+            "node": "Ответ клиенту",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "b24-n8n-granular-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bitrix24 REST proxy for n8n: per-key method allowlists and IP restrictions on top of a single full-access webhook",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:test": "node scripts/build.mjs --test",
+    "test": "node --test tests/guard.test.mjs",
+    "test:e2e": "bash tests/e2e/run.sh"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
